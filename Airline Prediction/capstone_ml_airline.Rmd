@@ -1,0 +1,311 @@
+---
+title: 'Airline Machine Learning Capstone'
+author: "Emannuelle Alpha"
+date: "`r format(Sys.Date(), '%B %e, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 1
+    df_print: paged
+    number_sections: true
+    css: assets/style.css
+---
+
+```{r setup, include=FALSE}
+# chunk options
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  comment = "#>"
+)
+```
+
+Today, I'm going to present to you about my result on this Machine Learning Capstone. We will be working on an Airline dataset. 
+
+# Data Wrangling
+
+## Library Needed
+
+Before we start our project, we need to call out some libraries that is necessary for the data processing.
+
+```{r, warning=F}
+library(tidyverse)
+library(tidymodels)
+library(lime)
+library(rmarkdown)
+library(dplyr)
+library(lubridate)
+library(stringr)
+```
+
+## Importing Data
+
+```{r}
+flight <- read.csv("data/data-train-flight.csv")
+weather <- read.csv("data/data-train-weather.csv")
+test <- read.csv("data/flight-data-test.csv")
+```
+
+## Joining Data
+
+```{r}
+train <- left_join(x = flight, y = weather, by = "time_hour")
+```
+
+First, let's join both the flight and weather data and make them as the training data. After we imported the data, we can see that the train data is still in a seperate object, so we need to make them one dataset. Of course, after joining the data together it would be such a mess and we need to clean it up.
+
+## Cleaning Data
+
+```{r}
+train <- train %>%
+   mutate(sched_arr_time = str_replace(sched_arr_time, "(?=\\d{2}$)", ":"))
+```
+
+```{r}
+train <- train %>% 
+   separate(sched_arr_time, c("sched_arr_hour","sched_arr_minute"), sep = "([:])") %>% 
+   select(-c(year.y, month.y, day.y, hour.y, dep_time, sched_dep_time)) %>% 
+   rename(c(month = month.x, day = day.x, year = year.x, hour = hour.x)) %>% 
+   mutate(carrier = as.factor(carrier),
+          sched_arr_hour = as.integer(sched_arr_hour),
+          sched_arr_minute = as.integer(sched_arr_minute),
+          day = as.integer(wday(time_hour)),
+          time_hour = ymd_hms(time_hour, tz = "GMT"))
+```
+
+In this data wrangling, I transformed some of the incorrect type of cloumns and also seperating hours and minutes of each period columns. I seperated the hour and minute columns by adding a `:` character in the original columns using `stringr` and then separate them into 2 different columns. 
+
+# Explanatory Data Analysis
+
+```{r}
+prop.table(table(train$carrier, train$arr_status), margin = 2)
+glimpse(train)
+```
+
+Now that everything is prepared, check on the proportion, we did have an imbalanced class of the target variable wich is `arr_status` and we can see that the `US` carrier has the highest number of delay flights.
+
+# Model Fitting
+
+Before we split the data, we should prepare the data for the last time. I removed `carrier` column so that it won't effect the model and the `wind_gust` before i omitted the data because it has the most NA values and we don't want to lose too much information about the data.
+
+```{r}
+train <- train %>% 
+  select(-c(wind_gust,carrier)) %>% 
+  na.omit()
+glimpse(train)
+```
+
+## Data Splitting
+
+First, we check if there's a class imbalance. And after that we will try to split our data and make recipe for us to process the data later on the model fitting section. Then, I split the data using the `tidymodel` package with a proportion of 80% train and 20% test.
+
+```{r}
+prop.table(table(train$arr_status))
+```
+
+```{r}
+set.seed(123)
+intrain <- initial_split(train, prop = 0.8, strata = "arr_status")
+
+intrain
+```
+
+```{r}
+# Preprocess Recipes
+rec <- recipe(arr_status ~ month+day+dep_delay+sched_arr_hour+sched_arr_minute+hour+minute+temp+dewp+humid+wind_dir+wind_speed+pressure, data = training(intrain)) %>%
+  step_downsample(arr_status) %>% 
+  step_scale(all_numeric()) %>% 
+  step_nzv(all_numeric()) %>% 
+  prep()
+
+# Create Data Train and Data Test
+data_train <- juice(rec)
+data_test <- bake(rec, testing(intrain))
+```
+
+From the recipe above, I don't use all of the predictors such as the airplane details and a nearzerovar columns so that it won't effect the model's performance. Now we begin to make a model based on the `data_train` and let's predict it into the `data_test` which is still in the trained data before we test it on the actual test data. I will use the random forest model so that it can be interprated using LIME Method. In this model.
+
+```{r}
+#define model spec
+model_spec <- rand_forest(
+  mode = "classification",
+  mtry = 2,
+  trees = 500,
+  min_n = 1)
+
+#define model engine
+model_spec <- set_engine(model_spec,
+                         engine = "ranger",
+                         seed = 123,
+                         num.threads = parallel::detectCores(),
+                         importance = "impurity")
+
+#model fitting
+set.seed(123)
+model <- fit_xy(
+  object = model_spec,
+  x = select(data_train, -arr_status),
+  y = select(data_train, arr_status)
+)
+```
+
+```{r}
+pred_test <- predict(model, new_data = data_test %>% select(-arr_status)) %>% 
+  bind_cols(true = data_test$arr_status)
+
+pred_test %>% 
+  summarise(accuracy = accuracy_vec(true, .pred_class),
+            sensitivity = sens_vec(true, .pred_class),
+            precision = precision_vec(true, .pred_class),
+            specificity = spec_vec(true, .pred_class))
+```
+
+I used certain parameters as above and it created a certain number of accuracy, sensitivity, precision, and specificity. We will try to fix it by tuning our model again.
+
+```{r}
+#define model spec
+model_spec2 <- rand_forest(
+  mode = "classification",
+  mtry = 2,
+  trees = 1500,
+  min_n = 2)
+
+#define model engine
+model_spec2 <- set_engine(model_spec2,
+                         engine = "ranger",
+                         seed = 123,
+                         num.threads = parallel::detectCores(),
+                         importance = "impurity")
+
+#model fitting
+set.seed(123)
+model2 <- fit_xy(
+  object = model_spec2,
+  x = select(data_train, -arr_status),
+  y = select(data_train, arr_status)
+)
+```
+
+```{r}
+pred_test2 <- predict(model2, new_data = data_test %>% select(-arr_status)) %>% 
+  bind_cols(true = data_test$arr_status)
+
+pred_test2 %>% 
+  summarise(accuracy = accuracy_vec(true, .pred_class),
+            sensitivity = sens_vec(true, .pred_class),
+            precision = precision_vec(true, .pred_class),
+            specificity = spec_vec(true, .pred_class))
+```
+Now, we have a better model for us to predict it into the actual data test.
+
+# Model Evaluation
+
+Before predicting into the actual data test, let’s check the model performance.
+
+```{r}
+# get variable importance
+var_imp <- tidy(model2$fit$variable.importance) %>% 
+  arrange(desc(x))
+
+# tidying
+var_imp <- var_imp %>%
+  head(10) %>% 
+  rename(variable = names, importance = x) %>%
+  mutate(variable = reorder(variable, importance))
+
+# variable importance plot
+ggplot(var_imp, aes(x = variable, y = importance)) +
+  geom_col(aes(fill = importance), show.legend = F) +
+  geom_text(aes(label = round(importance, 2)), nudge_y = 1)+
+  coord_flip() +
+  labs(title = "Variables Importance (Top 10)", x = NULL, y = NULL, fill = NULL) +
+  scale_y_continuous(expand = expand_scale(mult = c(0, 0.1))) +
+  scale_fill_viridis_c()+
+  theme_minimal()
+```
+
+This is a plot that shows you how important each predictors are or we can say which predictor is the most significant effecting the model. Now, let's try to make another explainer to interprate our model.
+
+```{r}
+set.seed(123)
+explainer <- lime(x = data_test %>% select(-arr_status),
+                  model = model2)
+```
+
+```{r}
+set.seed(123)
+
+explanation <- explain(data_test %>% select(-arr_status) %>% slice(1:4),
+                       labels = "Delay",
+                       n_permutations = 500,
+                       explainer = explainer,
+                       kernel_width = 3,
+                       n_features = 10)
+
+plot_features(explanation)
+```
+From this plot, there are some informations that we need to understand, such as:
+  1. The label `Delay` explains the predicted target variable.
+  2. The Probability explains the probability of the certain departure will be delayed or not.
+  3. We can see that if they have a probability that is bigger than 50%, it will predict the `arrival status` into `Not Delay` rather than `Delay`
+  4. `dep_delay` or The Departure Delay is contradicted with the target variable, so the earlier it departs, the lower the chance for the flight to be delayed
+  5. And for `pressure`, it supports the prediction, when the air pressure is higher, it would likely been delayed. And so on.
+
+# Conclusion
+
+After making a model and interprated it, we finally come to the conclusion. From what I did, my goal has been achieved although it's not 100% succeed, we still have 1 metric evaluation that is not yet accomplished, but my target in this model, is the accuracy metric evaluation because we predicted the positive class and it turned out not so bad. The problem of this case is whether a flight will be `Delayed` or `Not Delayed` and by using Machine Learning, of course we can fix the problem. We just need to build the best model for our prediction on the case involved. In this case, I used a random model and I would say the performance is not that bad on the training data or even on the testing data. From this Machine Learning Capstone Project, specifically this Airline Case, I expect to implement this case in the future to every single carrier in the world and to make every prediction about a flight. By this Machine Learning I also expect to implement Machine Learning in every field of work.
+
+# Submission
+
+> The steps below are the steps for submitting to the leaderboard
+
+Before we predict the unseen data, we have to prepare the data first the same as our trained data.
+
+```{r}
+test <- test %>%
+   mutate(sched_arr_time = str_replace(sched_arr_time, "(?=\\d{2}$)", ":"))
+```
+
+```{r}
+test <- test %>% 
+   separate(sched_arr_time, c("sched_arr_hour","sched_arr_minute"), sep = "([:])") %>% 
+   select(-c(dep_time, sched_dep_time)) %>% 
+   mutate(carrier = as.factor(carrier),
+          sched_arr_hour = as.integer(sched_arr_hour),
+          sched_arr_minute = as.integer(sched_arr_minute),
+          day = as.integer(wday(time_hour)),
+          time_hour = ymd_hms(time_hour, tz = "GMT")) %>% 
+  fill(c(temp, dewp, humid, wind_dir, wind_speed, pressure))
+```
+
+```{r}
+test <- test %>% 
+  select(-c(wind_gust,carrier))
+```
+
+Now, we will process the testing data and make a prediction on the testing data.
+
+```{r}
+test_final <- bake(rec, test)
+```
+
+
+```{r}
+# Predict on the data test
+pred_test_final <- predict(model2, new_data = test_final %>% select(-arr_status))
+```
+
+```{r}
+submission <- test %>% 
+  mutate(arr_status = pred_test_final$.pred_class) %>% 
+  select(id, arr_status)
+```
+
+```{r}
+write.csv(submission, "submission-alpha.csv", row.names = F)
+```
